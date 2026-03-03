@@ -1,7 +1,7 @@
 /**
  * SafeRelay - Telegram 双向机器人
  * 项目地址: https://github.com/qianqi32/SafeRelay
- * 版本: 1.0.0
+ * 版本: 1.0.1
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
 */
 
@@ -17,6 +17,10 @@ const ADMIN_UID = ENV_ADMIN_UID;
 
 // 验证通过后的有效期 (秒)，默认 30 天
 const VERIFICATION_TTL = 60 * 60 * 24 * 30;
+
+// 防刷屏配置
+const RATE_LIMIT_WINDOW_MS = 5000; // 5秒窗口
+const RATE_LIMIT_MAX_MSG = 5; // 5秒内最多5条消息
 
 // 联合封禁配置
 const UNION_BAN_API_URL = "https://verify.wzxabc.eu.org";
@@ -93,6 +97,82 @@ function memDelete(key) {
     memCache.delete(key);
 }
 
+// 防刷屏限流器
+const rateLimitCache = new Map();
+
+function checkRateLimit(userId) {
+    const now = Date.now();
+    const key = `ratelimit:${userId}`;
+    let userData = rateLimitCache.get(key);
+    
+    if (!userData) {
+        userData = { count: 1, firstMessage: now };
+        rateLimitCache.set(key, userData);
+        return { allowed: true, remaining: RATE_LIMIT_MAX_MSG - 1 };
+    }
+    
+    // 检查是否在时间窗口内
+    if (now - userData.firstMessage > RATE_LIMIT_WINDOW_MS) {
+        // 重置窗口
+        userData.count = 1;
+        userData.firstMessage = now;
+        return { allowed: true, remaining: RATE_LIMIT_MAX_MSG - 1 };
+    }
+    
+    // 在窗口内，检查次数
+    if (userData.count >= RATE_LIMIT_MAX_MSG) {
+        const retryAfter = Math.ceil((RATE_LIMIT_WINDOW_MS - (now - userData.firstMessage)) / 1000);
+        return { allowed: false, retryAfter };
+    }
+    
+    userData.count++;
+    return { allowed: true, remaining: RATE_LIMIT_MAX_MSG - userData.count };
+}
+
+// 已验证用户列表管理
+async function addVerifiedUser(userId) {
+    const key = 'verified_users_list';
+    try {
+        const users = await KV.get(key);
+        const userSet = users ? new Set(JSON.parse(users)) : new Set();
+        
+        // 只有新用户才更新
+        if (!userSet.has(userId)) {
+            userSet.add(userId);
+            await KV.put(key, JSON.stringify([...userSet]));
+        }
+    } catch (e) {
+        console.error('Failed to add verified user:', e);
+    }
+}
+
+async function removeVerifiedUser(userId) {
+    const key = 'verified_users_list';
+    try {
+        const users = await KV.get(key);
+        if (!users) return;
+        
+        const userSet = new Set(JSON.parse(users));
+        if (userSet.has(userId)) {
+            userSet.delete(userId);
+            await KV.put(key, JSON.stringify([...userSet]));
+        }
+    } catch (e) {
+        console.error('Failed to remove verified user:', e);
+    }
+}
+
+async function getAllVerifiedUsers() {
+    const key = 'verified_users_list';
+    try {
+        const users = await KV.get(key);
+        return users ? JSON.parse(users) : [];
+    } catch (e) {
+        console.error('Failed to get verified users:', e);
+        return [];
+    }
+}
+
 // 配置管理
 const CONFIG_KEYS = {
     WELCOME_MSG: 'config:welcome_msg',
@@ -133,20 +213,10 @@ async function reportError(error, context = "") {
     }
 }
 
-// 广播功能
+// 广播功能 - 获取所有已验证用户
 async function getVerifiedUsers() {
-    // 从活跃用户记录中获取用户列表
-    const users = new Set();
-    const today = new Date().toISOString().split('T')[0];
-    
-    // 获取今日活跃用户
-    const activeUsers = await KV.get(`stats:active_users:${today}`);
-    if (activeUsers) {
-        const userList = JSON.parse(activeUsers);
-        userList.forEach(uid => users.add(uid));
-    }
-    
-    return Array.from(users);
+    // 使用已验证用户列表
+    return await getAllVerifiedUsers();
 }
 
 // 分批广播消息
@@ -405,6 +475,15 @@ async function onMessage(message, origin) {
     const isVerified = await KV.get('verified-' + chatId);
 
     if (isVerified) {
+      // 3. 检查防刷屏限制
+      const rateLimit = checkRateLimit(chatId);
+      if (!rateLimit.allowed) {
+        return sendMessage({
+          chat_id: chatId,
+          text: `⚠️ 发送过于频繁，请等待 ${rateLimit.retryAfter} 秒后再试。`
+        });
+      }
+      
       // 已验证，发送自动回复（如果设置了）
       const autoReplyMsg = await getConfig(CONFIG_KEYS.AUTO_REPLY_MSG);
       if (autoReplyMsg && message.text === '/start') {
@@ -799,6 +878,7 @@ async function handleAdminMessage(message) {
       if (guestChatId) {
         await KV.put('blocked-' + guestChatId, 'true'); // 永久拉黑
         memDelete('blocked-' + guestChatId); // 清除缓存
+        await removeVerifiedUser(guestChatId); // 从已验证列表移除
         return sendMessage({ chat_id: ADMIN_UID, text: `🚫 用户 ${guestChatId} 已被拉黑。` });
       } else {
         return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 无法获取用户ID，可能是旧消息。' });
@@ -826,6 +906,7 @@ async function handleAdminMessage(message) {
     if (targetId) {
       await KV.delete('verified-' + targetId);
       memDelete('verified-' + targetId); // 清除缓存
+      await removeVerifiedUser(targetId); // 从已验证列表移除
       return sendMessage({ chat_id: ADMIN_UID, text: `🔄 用户 ${targetId} 验证状态已重置。` });
     } else {
       return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 格式错误。\n请回复用户消息发送 /clear_ver\n或发送 /clear_ver 123456 (必须是数字 ID)' });
@@ -902,9 +983,19 @@ async function handleAdminMessage(message) {
 
   // --- 普通回复逻辑 ---
 
-  // 检查是否在回复转发消息
-  if (reply && (reply.forward_from || reply.forward_sender_name)) {
-    const guestChatId = await KV.get('msg-map-' + reply.message_id);
+  // 检查是否在回复转发消息或编辑提示消息
+  if (reply) {
+    let guestChatId = null;
+    
+    // 情况1：回复转发消息
+    if (reply.forward_from || reply.forward_sender_name) {
+      guestChatId = await KV.get('msg-map-' + reply.message_id);
+    }
+    // 情况2：回复编辑提示消息（以 ✏️ 开头）
+    else if (reply.text && reply.text.startsWith('✏️')) {
+      guestChatId = await KV.get('msg-map-' + reply.message_id);
+    }
+    
     if (guestChatId) {
       const copyReq = await copyMessage({
         chat_id: guestChatId,
@@ -960,89 +1051,287 @@ async function handleVerification(message, chatId, origin) {
 
 // 渲染验证页面
 function handleVerifyPage(request) {
+  // 中文语言配置
+  const t = {
+    title: '人机验证 - SafeRelay',
+    heading: '安全验证',
+    subtitle: '请完成下方验证以继续对话',
+    success: '验证成功！',
+    successDesc: '请返回 Telegram 继续聊天',
+    error: '验证失败',
+    errorDesc: '请重试或刷新页面',
+    retry: '重新验证',
+    footer: '该界面由 SafeRelay 提供',
+    loading: '验证中...'
+  };
+  
   const html = `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>人机验证 - SafeRelay</title>
+    <title>${t.title}</title>
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        
+        * {
+            transition: background-color 0.3s ease, color 0.3s ease;
+        }
+        
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
-        .soft-gradient {
+        
+        /* 浅色模式 - Soft UI 风格 */
+        .theme-light {
             background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
         }
+        
+        .theme-light .card {
+            background: white;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.05), 0 10px 10px -5px rgba(0, 0, 0, 0.02);
+        }
+        
+        .theme-light .icon-bg {
+            background: #eef2ff;
+        }
+        
+        .theme-light .icon-color {
+            color: #6366f1;
+        }
+        
+        .theme-light .text-primary {
+            color: #1e293b;
+        }
+        
+        .theme-light .text-secondary {
+            color: #64748b;
+        }
+        
+        .theme-light .error-bg {
+            background: #fef2f2;
+        }
+        
+        .theme-light .error-text {
+            color: #dc2626;
+        }
+        
+        .theme-light .success-bg {
+            background: #f0fdf4;
+        }
+        
+        .theme-light .success-icon {
+            color: #16a34a;
+        }
+        
+        /* 深色模式 - Soft UI 风格 */
+        .theme-dark {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        }
+        
+        .theme-dark .card {
+            background: #1e293b;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3), 0 10px 10px -5px rgba(0, 0, 0, 0.2);
+        }
+        
+        .theme-dark .icon-bg {
+            background: #312e81;
+        }
+        
+        .theme-dark .icon-color {
+            color: #818cf8;
+        }
+        
+        .theme-dark .text-primary {
+            color: #f1f5f9;
+        }
+        
+        .theme-dark .text-secondary {
+            color: #94a3b8;
+        }
+        
+        .theme-dark .error-bg {
+            background: rgba(220, 38, 38, 0.15);
+        }
+        
+        .theme-dark .error-text {
+            color: #f87171;
+        }
+        
+        .theme-dark .success-bg {
+            background: rgba(22, 163, 74, 0.15);
+        }
+        
+        .theme-dark .success-icon {
+            color: #4ade80;
+        }
+        
+        /* 按钮样式 - Soft UI */
+        .btn-primary {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            box-shadow: 0 10px 15px -3px rgba(99, 102, 241, 0.3);
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 20px 25px -5px rgba(99, 102, 241, 0.4);
+        }
+        
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+        
+        .btn-secondary {
+            background: #f1f5f9;
+        }
+        
+        .theme-dark .btn-secondary {
+            background: #334155;
+        }
+        
         .turnstile-container {
             min-height: 65px;
             display: flex;
             align-items: center;
             justify-content: center;
         }
+        
+        .hidden {
+            display: none !important;
+        }
     </style>
 </head>
-<body class="soft-gradient min-h-screen flex items-center justify-center p-4 md:p-6">
+<body class="theme-light min-h-screen flex items-center justify-center p-4 md:p-6">
     <div class="w-full max-w-md">
-        <!-- 主卡片 -->
-        <div class="bg-white rounded-3xl shadow-xl shadow-gray-200/50 p-6 md:p-8 text-center transition-all duration-300">
+        <!-- 主卡片 - Soft UI 风格 -->
+        <div class="card rounded-3xl p-6 md:p-8 text-center transition-all duration-300">
             <!-- 图标 -->
-            <div class="w-16 h-16 md:w-20 md:h-20 mx-auto mb-6 bg-indigo-50 rounded-2xl flex items-center justify-center">
-                <svg class="w-8 h-8 md:w-10 md:h-10 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <div class="icon-bg w-16 h-16 md:w-20 md:h-20 mx-auto mb-6 rounded-2xl flex items-center justify-center transition-all duration-300">
+                <svg class="icon-color w-8 h-8 md:w-10 md:h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
                 </svg>
             </div>
             
             <!-- 标题 -->
-            <h1 class="text-xl md:text-2xl font-semibold text-slate-800 mb-2">安全验证</h1>
-            <p class="text-sm md:text-base text-slate-500 mb-8">请完成下方验证以继续对话</p>
+            <h1 class="text-primary text-xl md:text-2xl font-semibold mb-2 transition-colors duration-300">${t.heading}</h1>
+            <p class="text-secondary text-sm md:text-base mb-8 transition-colors duration-300">${t.subtitle}</p>
             
             <!-- Turnstile 验证区域 -->
-            <div class="turnstile-container mb-6">
-                <div id="turnstile-widget" class="cf-turnstile" data-sitekey="${CF_TURNSTILE_SITE_KEY}" data-callback="onVerify" data-theme="light"></div>
+            <div id="verify-section" class="turnstile-container mb-6">
+                <div id="turnstile-widget" class="cf-turnstile" data-sitekey="${CF_TURNSTILE_SITE_KEY}" data-callback="onVerify" data-theme="auto"></div>
+            </div>
+            
+            <!-- 加载状态 -->
+            <div id="loading-msg" class="hidden mb-6">
+                <div class="inline-flex items-center gap-2 text-secondary">
+                    <svg class="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span class="text-sm">${t.loading}</span>
+                </div>
             </div>
             
             <!-- 成功消息 -->
             <div id="success-msg" class="hidden">
-                <div class="w-14 h-14 md:w-16 md:h-16 mx-auto mb-4 bg-emerald-50 rounded-2xl flex items-center justify-center">
-                    <svg class="w-7 h-7 md:w-8 md:h-8 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <div class="success-bg w-14 h-14 md:w-16 md:h-16 mx-auto mb-4 rounded-2xl flex items-center justify-center transition-all duration-300">
+                    <svg class="success-icon w-7 h-7 md:w-8 md:h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
                     </svg>
                 </div>
-                <h2 class="text-lg md:text-xl font-semibold text-slate-800 mb-2">验证成功！</h2>
-                <p class="text-sm md:text-base text-slate-500">请返回 Telegram 继续聊天</p>
+                <h2 class="text-primary text-lg md:text-xl font-semibold mb-2 transition-colors duration-300">${t.success}</h2>
+                <p class="text-secondary text-sm md:text-base transition-colors duration-300">${t.successDesc}</p>
             </div>
             
             <!-- 错误消息 -->
-            <div id="error-msg" class="hidden mt-4 p-4 bg-rose-50 rounded-2xl">
-                <p class="text-sm text-rose-600">验证失败，请刷新页面重试</p>
+            <div id="error-msg" class="hidden mt-4">
+                <div class="error-bg rounded-2xl p-4 mb-4 transition-all duration-300">
+                    <p class="error-text text-sm font-medium">${t.error}</p>
+                    <p class="text-secondary text-xs mt-1">${t.errorDesc}</p>
+                </div>
+                <!-- 重试按钮 -->
+                <button onclick="resetVerification()" class="btn-primary text-white font-medium px-6 py-3 rounded-2xl transition-all duration-200">
+                    ${t.retry}
+                </button>
             </div>
         </div>
         
         <!-- 底部信息 -->
         <div class="mt-6 text-center">
-            <p class="text-xs text-slate-400">由 SafeRelay 提供安全保护</p>
+            <p class="text-secondary text-xs transition-colors duration-300">${t.footer}</p>
         </div>
     </div>
 
     <script>
         // 初始化 Telegram Web App
         let tg;
+        let currentTheme = 'light';
+        
         try {
             tg = window.Telegram.WebApp;
             if (tg) {
                 tg.ready();
                 tg.expand();
-                // 设置主题色
-                tg.setHeaderColor('#f8fafc');
-                tg.setBackgroundColor('#f8fafc');
+                
+                // 获取 Telegram 主题
+                const themeParams = tg.themeParams;
+                currentTheme = tg.colorScheme || 'light';
+                
+                // 应用主题
+                applyTheme(currentTheme);
+                
+                // 监听主题变化
+                tg.onEvent('themeChanged', function() {
+                    currentTheme = tg.colorScheme || 'light';
+                    applyTheme(currentTheme);
+                });
             }
         } catch (e) {
             console.log('Telegram Web App 初始化失败:', e);
+            // 检测系统主题
+            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                applyTheme('dark');
+            }
+        }
+        
+        // 应用主题
+        function applyTheme(theme) {
+            document.body.classList.remove('theme-light', 'theme-dark');
+            document.body.classList.add('theme-' + theme);
+            
+            // 更新 Turnstile 主题
+            const turnstileWidget = document.getElementById('turnstile-widget');
+            if (turnstileWidget) {
+                turnstileWidget.setAttribute('data-theme', theme);
+            }
+            
+            // 更新 Telegram Web App 主题色
+            if (tg) {
+                const bgColor = theme === 'dark' ? '#0f172a' : '#f8fafc';
+                tg.setHeaderColor(bgColor);
+                tg.setBackgroundColor(bgColor);
+            }
+        }
+        
+        // 重置验证
+        function resetVerification() {
+            // 隐藏错误消息
+            document.getElementById('error-msg').classList.add('hidden');
+            
+            // 显示验证区域
+            document.getElementById('verify-section').classList.remove('hidden');
+            
+            // 重置 Turnstile
+            if (typeof turnstile !== 'undefined') {
+                turnstile.reset();
+            } else {
+                // 如果 Turnstile API 不可用，刷新页面
+                window.location.reload();
+            }
         }
 
         function onVerify(token) {
@@ -1050,9 +1339,13 @@ function handleVerifyPage(request) {
             const uid = urlParams.get('uid');
             
             if (!uid) {
-                document.getElementById('error-msg').classList.remove('hidden');
+                showError();
                 return;
             }
+            
+            // 显示加载状态
+            document.getElementById('verify-section').classList.add('hidden');
+            document.getElementById('loading-msg').classList.remove('hidden');
 
             fetch('/verify-callback', {
                 method: 'POST',
@@ -1061,8 +1354,8 @@ function handleVerifyPage(request) {
             })
             .then(response => {
                 if (response.ok) {
-                    // 隐藏验证组件，显示成功消息
-                    document.querySelector('.turnstile-container').style.display = 'none';
+                    // 隐藏加载状态，显示成功消息
+                    document.getElementById('loading-msg').classList.add('hidden');
                     document.getElementById('success-msg').classList.remove('hidden');
                     
                     // 验证成功 1.5 秒后尝试关闭窗口
@@ -1080,8 +1373,15 @@ function handleVerifyPage(request) {
                 }
             })
             .catch(err => {
-                document.getElementById('error-msg').classList.remove('hidden');
+                console.error('验证失败:', err);
+                showError();
             });
+        }
+        
+        function showError() {
+            document.getElementById('loading-msg').classList.add('hidden');
+            document.getElementById('verify-section').classList.add('hidden');
+            document.getElementById('error-msg').classList.remove('hidden');
         }
     </script>
 </body>
@@ -1120,6 +1420,9 @@ async function handleVerifyCallback(request) {
       // 验证通过！写入 KV
       await KV.put('verified-' + uid, 'true', { expirationTtl: VERIFICATION_TTL });
       memSet('verified-' + uid, 'true', 5 * 60 * 1000); // 更新缓存
+      
+      // 添加到已验证用户列表
+      await addVerifiedUser(uid);
 
       // 主动通知用户验证成功
       await sendMessage({
@@ -1207,28 +1510,51 @@ async function handleGuestMessage(message) {
 // 处理访客编辑后的消息
 async function handleGuestEditedMessage(message) {
   const origMessageId = message.message_id.toString();
-  
-  // 查找原始消息转发后的 ID
+  const chatId = message.chat.id.toString();
+
+  // 查找原始消息转发后的 ID（用于回复引用）
   const forwardedMessageId = await KV.get('orig-map-' + origMessageId);
-  
-  // 重新转发编辑后的消息
-  const forwardReq = await forwardMessage({
+
+  // 查找是否已有编辑提示消息
+  const editNoticeKey = `edit-notice:${chatId}:${origMessageId}`;
+  const existingNoticeId = await KV.get(editNoticeKey);
+
+  const editNotice = `✏️ ${escapeHtml(message.text || '(无文本内容)')}`;
+
+  if (existingNoticeId) {
+    // 已有编辑提示，尝试更新
+    try {
+      const editReq = await requestTelegram('editMessageText', {
+        chat_id: ADMIN_UID,
+        message_id: parseInt(existingNoticeId),
+        text: editNotice,
+        parse_mode: 'HTML'
+      });
+
+      if (editReq.ok) {
+        // 更新成功
+        return;
+      }
+      // 更新失败（可能消息被删除），继续发送新消息
+    } catch (e) {
+      console.error('更新编辑提示失败:', e);
+      // 继续发送新消息
+    }
+  }
+
+  // 发送新的编辑提示
+  const result = await sendMessage({
     chat_id: ADMIN_UID,
-    from_chat_id: message.chat.id,
-    message_id: message.message_id
+    text: editNotice,
+    parse_mode: 'HTML',
+    reply_to_message_id: forwardedMessageId || undefined
   });
-  
-  if (forwardReq.ok && forwardReq.result && forwardReq.result.message_id) {
-    // 存储新的映射关系
-    await KV.put('msg-map-' + forwardReq.result.message_id, message.chat.id.toString(), { expirationTtl: 172800 });
-    await KV.put('orig-map-' + message.message_id, forwardReq.result.message_id.toString(), { expirationTtl: 172800 });
-    
-    
-  } else {
-    await sendMessage({
-      chat_id: ADMIN_UID,
-      text: `❌ 转发编辑消息失败：${JSON.stringify(forwardReq)}`
-    });
+
+  // 存储映射关系
+  if (result.ok && result.result && result.result.message_id) {
+    await KV.put('msg-map-' + result.result.message_id, chatId, { expirationTtl: 172800 });
+    // 存储编辑提示消息ID，用于后续更新
+    await KV.put(editNoticeKey, result.result.message_id.toString(), { expirationTtl: 172800 });
   }
 }
 
@@ -1251,18 +1577,22 @@ async function handleAdminEditedMessage(message) {
       });
       
       if (!editReq.ok) {
-        // 编辑失败，可能消息已被删除或其他原因
-        // 发送新消息给访客
-        await sendMessage({
-          chat_id: guestChatId,
-          text: `🔄 管理员编辑了消息：\n${message.text || ''}`
-        });
+        // 编辑失败，只通知管理员
+        const errorCode = editReq.error_code;
         
-        // 通知管理员编辑失败但已发送新消息
-        await sendMessage({
-          chat_id: ADMIN_UID,
-          text: `⚠️ 编辑回复消息失败，已发送新消息给用户：${JSON.stringify(editReq)}`
-        });
+        // 消息已过期或被删除 (错误码 400)
+        if (errorCode === 400) {
+          await sendMessage({
+            chat_id: ADMIN_UID,
+            text: `⚠️ 无法编辑消息：消息已过期或被删除（超过48小时）。\n\n如需修改，请直接发送新消息。`
+          });
+        } else {
+          // 其他错误，只通知管理员编辑失败
+          await sendMessage({
+            chat_id: ADMIN_UID,
+            text: `⚠️ 编辑消息失败：${editReq.description || '未知错误'}\n\n如需修改，请直接发送新消息。`
+          });
+        }
       }
     } catch (e) {
       // 解析映射数据失败
@@ -1273,10 +1603,9 @@ async function handleAdminEditedMessage(message) {
     }
   } else {
     // 未找到映射关系，可能是旧消息或映射已过期
-    // 通知管理员
     await sendMessage({
       chat_id: ADMIN_UID,
-      text: `⚠️ 未找到消息映射关系，无法同步编辑到用户`
+      text: `⚠️ 未找到消息映射关系，无法同步编辑到用户。\n\n可能原因：消息已过期（超过48小时）或机器人已重启。`
     });
   }
 }
