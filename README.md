@@ -1,7 +1,5 @@
 # SafeRelay - 安全私聊机器人
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/qianqi32/SafeRelay)
-
 ## 🔥 项目简介
 
 SafeRelay 是一个轻量级的 Telegra 私聊机器人，专注于防骚扰和高效沟通。它采用 **单对单** 模式，支持人机验证、联合封禁、自定义欢迎消息和自动回复等多个功能。
