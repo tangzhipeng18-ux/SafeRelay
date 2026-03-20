@@ -6,8 +6,8 @@
 */
 
 // Cloudflare Turnstile 配置（可选，用于网页验证）
-const CF_TURNSTILE_SITE_KEY = '0x4AAAAAAAXXXXXXXXXXXXXXXXXXXX';  // 替换为你的 Site Key
-const CF_TURNSTILE_SECRET_KEY = '0x4AAAAAAAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';  // 替换为你的 Secret Key
+const CF_TURNSTILE_SITE_KEY = '0x4AAAAAACtkkp-UjoYsVWxe';  // 替换为你的 Site Key
+const CF_TURNSTILE_SECRET_KEY = '0x4AAAAAACtkkngPzOPMsGUf5j3Qu8VKa-I';  // 替换为你的 Secret Key
 
 // 基础配置
 const getEnv = (key) => {
